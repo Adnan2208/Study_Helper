@@ -1,0 +1,215 @@
+id: Study_Helper
+namespace: company.team
+
+inputs:
+  - id: drive_url
+    type: STRING
+    description: The link to the user's study notes.
+  - id: huggingface_api_key
+    type: STRING
+    required: true
+    description: API token for authentication.
+  - id: serpapi_api_key
+    type: STRING
+    required: true
+    description: For YouTube search.
+
+tasks:
+  - id: fetch_data
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install kestra requests
+    script: |
+      import requests
+      from kestra import Kestra
+
+      url = "{{ inputs.drive_url }}"
+      try:
+          response = requests.get(url)
+          response.raise_for_status()
+          content = response.text
+          
+          # Output the content
+          Kestra.outputs({'content': content})
+      except Exception as e:
+          print(f"Error fetching data: {e}")
+          raise
+
+  - id: ai_analysis
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install kestra requests
+    env:
+      # SAFE WAY: Pass content as an environment variable to handle special characters/quotes
+      NOTES_CONTENT: "{{ outputs.fetch_data.vars.content }}"
+    script: |
+      import os
+      import requests
+      from kestra import Kestra
+
+      # Retrieve content safely from environment variable
+      content = os.environ.get("NOTES_CONTENT", "")
+      api_key = "{{ inputs.huggingface_api_key }}"
+      
+      API_URL = "https://router.huggingface.co/v1/chat/completions"
+      headers = {
+          "Authorization": f"Bearer {api_key}",
+          "Content-Type": "application/json"
+      }
+
+      # Define JSON format separately to avoid Pebble/Python f-string conflict with curly braces
+      json_fmt = '{"summary": "...", "difficulty": "..."}'
+
+      prompt = f"""Analyze the following study notes. 1) Summarize them in 3 sentences. 2) Classify difficulty as exactly 'TOUGH' or 'SIMPLE'. 3) Return ONLY valid JSON in this format: {json_fmt}. Do not add any conversational text before or after the JSON.
+
+      Notes:
+      {content}
+      """
+
+      payload = {
+          "model": "HuggingFaceTB/SmolLM3-3B:hf-inference",
+          "messages": [
+              {
+                  "role": "user",
+                  "content": prompt
+              }
+          ],
+      }
+
+      try:
+          response = requests.post(API_URL, headers=headers, json=payload)
+          response.raise_for_status()
+          
+          result = response.json()
+          generated_text = result["choices"][0]["message"]["content"]
+          Kestra.outputs({'result': generated_text})
+
+      except Exception as e:
+          print(f"Error during AI analysis: {e}")
+          if 'response' in locals():
+              print(f"Response Status: {response.status_code}")
+              print(f"Response Body: {response.text}")
+          raise
+
+  - id: parse_json
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install kestra
+    env:
+      RAW_OUTPUT: "{{ outputs.ai_analysis.vars.result }}"
+    script: |
+      import json
+      import os
+      import re
+      from kestra import Kestra
+
+      raw_output = os.environ.get('RAW_OUTPUT', '')
+      
+      try:
+          # Find JSON object using regex to capture the first valid JSON block
+          match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+          
+          if match:
+              json_str = match.group(0)
+              decoder = json.JSONDecoder()
+              data, _ = decoder.raw_decode(json_str)
+              
+              Kestra.outputs({
+                  'summary': data.get('summary', 'No summary provided'),
+                  'difficulty': data.get('difficulty', 'UNKNOWN')
+              })
+          else:
+              print("No JSON found in output")
+              Kestra.outputs({'difficulty': 'UNKNOWN', 'summary': 'Error parsing output'})
+              
+      except Exception as e:
+          print(f"Error parsing JSON: {e}")
+          Kestra.outputs({'difficulty': 'ERROR', 'summary': str(e)})
+
+  - id: check_difficulty
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.parse_json.vars.difficulty == 'TOUGH' }}"
+    then:
+      - id: search_youtube
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install requests kestra
+        script: |
+          import requests
+          from kestra import Kestra
+
+          api_key = "{{ inputs.serpapi_api_key }}"
+          query = "Lecture on {{ outputs.parse_json.vars.summary }}"
+          
+          print(f"Searching YouTube for: {query}")
+          
+          params = {
+            "engine": "youtube",
+            "search_query": query,
+            "api_key": api_key
+          }
+          
+          try:
+              response = requests.get("https://serpapi.com/search", params=params)
+              response.raise_for_status()
+              results = response.json()
+              
+              video_results = results.get("video_results", [])
+              
+              if video_results:
+                  first_video = video_results[0]
+                  title = first_video.get("title", "Unknown Title")
+                  link = first_video.get("link", "No Link")
+                  print(f"Found video: {title} - {link}")
+                  Kestra.outputs({'video_title': title, 'video_link': link})
+              else:
+                  print("No video results found.")
+                  Kestra.outputs({'video_title': 'Not Found', 'video_link': 'None'})
+
+          except Exception as e:
+              print(f"Error searching SerpApi: {e}")
+              raise
+
+  - id: final_output
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install kestra
+    env:
+      SUMMARY: "{{ outputs.parse_json.vars.summary }}"
+      DIFFICULTY: "{{ outputs.parse_json.vars.difficulty }}"
+      VIDEO_TITLE: "{{ outputs.search_youtube is defined ? outputs.search_youtube.vars.video_title : 'None' }}"
+      VIDEO_LINK: "{{ outputs.search_youtube is defined ? outputs.search_youtube.vars.video_link : 'None' }}"
+    script: |
+      import os
+      from kestra import Kestra
+
+      summary = os.environ.get('SUMMARY')
+      difficulty = os.environ.get('DIFFICULTY')
+      video_title = os.environ.get('VIDEO_TITLE')
+      video_link = os.environ.get('VIDEO_LINK')
+
+      outputs = {
+          'summary': summary,
+          'difficulty': difficulty
+      }
+
+      if video_title != 'None':
+          outputs['video_title'] = video_title
+          outputs['video_link'] = video_link
+          
+      Kestra.outputs(outputs)
