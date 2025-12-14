@@ -2,60 +2,292 @@ id: Study_Helper
 namespace: company.team
 
 inputs:
-  - id: drive_url
+  - id: drive_folder_url
     type: STRING
-    description: The link to the user's study notes.
+    description: Google Drive folder URL (make it publicly accessible or use 'Anyone with link can view')
   - id: huggingface_api_key
     type: STRING
     required: true
-    description: API token for authentication.
+    description: API token for HuggingFace
   - id: serpapi_api_key
     type: STRING
     required: true
-    description: For YouTube search.
+    description: For YouTube search
+  - id: user_study_hours_per_day
+    type: FLOAT
+    description: How many hours per day user can study
 
 tasks:
-  - id: fetch_data
+  # Task 1: Fetch all files from Google Drive folder (Public/Shared Link)
+  - id: fetch_drive_folder
     type: io.kestra.plugin.scripts.python.Script
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
     containerImage: python:3.11-slim
+    outputFiles:
+      - "study_content.txt"
     beforeCommands:
-      - pip install kestra requests
+      - pip install kestra requests beautifulsoup4 PyPDF2 python-docx lxml
     script: |
       import requests
+      import re
+      import json
       from kestra import Kestra
-
-      url = "{{ inputs.drive_url }}"
+      from bs4 import BeautifulSoup
+      
+      folder_url = "{{ inputs.drive_folder_url }}"
+      
+      # Extract folder ID from URL or use directly if it's just an ID
+      folder_id_match = re.search(r'/folders/([a-zA-Z0-9_-]+)', folder_url)
+      if folder_id_match:
+          folder_id = folder_id_match.group(1)
+      elif re.match(r'^[a-zA-Z0-9_-]+$', folder_url):
+          folder_id = folder_url
+      else:
+          raise Exception("Invalid Google Drive folder URL or ID")
+      
+      print(f"Using Folder ID: {folder_id}")
+      print("=" * 60)
+      
+      session = requests.Session()
+      headers = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Connection': 'keep-alive'
+      }
+      
       try:
-          response = requests.get(url)
-          response.raise_for_status()
-          content = response.text
+          # Step 1: Fetch the folder page HTML
+          folder_url_web = f"https://drive.google.com/drive/folders/{folder_id}"
+          print(f"Fetching folder page: {folder_url_web}")
           
-          # Output the content
-          Kestra.outputs({'content': content})
+          response = session.get(folder_url_web, headers=headers, timeout=30)
+          response.raise_for_status()
+          
+          print(f"Response status: {response.status_code}")
+          
+          # Step 2: Parse HTML to extract file information
+          soup = BeautifulSoup(response.text, 'html.parser')
+          
+          # Extract file IDs and names from the page source
+          # Google Drive embeds data in script tags
+          file_data = []
+          
+          # Method 1: Look for file IDs in the page source
+          # Pattern to match Google Drive file IDs (33 characters, alphanumeric with - and _)
+          file_id_pattern = r'"([a-zA-Z0-9_-]{33})"'
+          potential_ids = list(set(re.findall(file_id_pattern, response.text)))
+          
+          # Filter out the folder ID itself
+          potential_ids = [fid for fid in potential_ids if fid != folder_id]
+          
+          print(f"Found {len(potential_ids)} potential file IDs")
+          
+          if not potential_ids:
+              raise Exception("No files found in folder. Make sure:\n1. Folder is set to 'Anyone with the link can view'\n2. Folder contains files\n3. You're using the correct folder ID")
+          
+          all_content = []
+          processed_count = 0
+          
+          # Step 3: Try to download each file
+          for idx, file_id in enumerate(potential_ids[:15], 1):  # Limit to 15 files
+              print(f"\n[{idx}/{min(15, len(potential_ids))}] Attempting file ID: {file_id}")
+              
+              try:
+                  # Try direct download first
+                  download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                  file_response = session.get(download_url, headers=headers, timeout=20, allow_redirects=True)
+                  
+                  # Check if we got actual content
+                  content_type = file_response.headers.get('Content-Type', '')
+                  content_length = len(file_response.content)
+                  
+                  print(f"  Content-Type: {content_type}")
+                  print(f"  Content-Length: {content_length} bytes")
+                  
+                  # Skip if it's HTML (likely an error page or download warning)
+                  if 'text/html' in content_type and content_length < 50000:
+                      print(f"  ✗ Skipped (HTML response)")
+                      continue
+                  
+                  # Skip if content is too small
+                  if content_length < 50:
+                      print(f"  ✗ Skipped (too small)")
+                      continue
+                  
+                  content = ""
+                  filename = f"document_{processed_count + 1}"
+                  raw_bytes = file_response.content
+                  
+                  # Detect file type using magic bytes (file signatures)
+                  # This is more reliable than Content-Type headers
+                  is_pdf = raw_bytes[:4] == b'%PDF'
+                  is_docx = raw_bytes[:4] == b'PK\x03\x04'  # DOCX/XLSX/PPTX are ZIP-based
+                  is_zip = raw_bytes[:2] == b'PK'
+                  
+                  print(f"  Magic bytes detection - PDF: {is_pdf}, DOCX/ZIP: {is_docx}")
+                  
+                  # Try to extract text based on detected file type
+                  if is_pdf or 'application/pdf' in content_type:
+                      try:
+                          import PyPDF2
+                          import io
+                          pdf_file = io.BytesIO(raw_bytes)
+                          pdf_reader = PyPDF2.PdfReader(pdf_file)
+                          content = "\n".join([page.extract_text() for page in pdf_reader.pages if page.extract_text()])
+                          filename = f"pdf_document_{processed_count + 1}.pdf"
+                          print(f"  Detected as PDF, extracted {len(content)} chars")
+                      except Exception as pdf_error:
+                          print(f"  ✗ PDF extraction failed: {pdf_error}")
+                          continue
+                  
+                  elif is_docx or 'application/vnd.openxmlformats-officedocument' in content_type or 'application/msword' in content_type:
+                      try:
+                          import docx
+                          import io
+                          doc_file = io.BytesIO(raw_bytes)
+                          doc = docx.Document(doc_file)
+                          content = '\n'.join([para.text for para in doc.paragraphs if para.text.strip()])
+                          filename = f"word_document_{processed_count + 1}.docx"
+                          print(f"  Detected as DOCX, extracted {len(content)} chars")
+                      except Exception as docx_error:
+                          print(f"  ✗ DOCX extraction failed: {docx_error}")
+                          continue
+                  
+                  elif 'text/plain' in content_type:
+                      try:
+                          content = file_response.text
+                          if len(content.strip()) > 100:
+                              filename = f"text_file_{processed_count + 1}.txt"
+                          print(f"  Detected as text, extracted {len(content)} chars")
+                      except:
+                          print(f"  ✗ Failed to decode as text")
+                          continue
+                  
+                  else:
+                      # Check if it might be readable text (ASCII/UTF-8)
+                      try:
+                          # Only treat as text if most bytes are printable ASCII
+                          sample = raw_bytes[:1000]
+                          printable_count = sum(1 for b in sample if 32 <= b <= 126 or b in (9, 10, 13))
+                          printable_ratio = printable_count / len(sample) if sample else 0
+                          
+                          if printable_ratio > 0.85:  # At least 85% printable characters
+                              content = raw_bytes.decode('utf-8', errors='ignore')
+                              if len(content.strip()) > 100:
+                                  filename = f"text_file_{processed_count + 1}.txt"
+                                  print(f"  Detected as text (ratio: {printable_ratio:.2f}), extracted {len(content)} chars")
+                              else:
+                                  print(f"  ✗ Content too short after decode")
+                                  continue
+                          else:
+                              print(f"  ✗ Binary file, cannot extract text (printable ratio: {printable_ratio:.2f})")
+                              continue
+                      except:
+                          print(f"  ✗ Unknown content type, skipped")
+                          continue
+                  
+                  # Validate content
+                  if content and len(content.strip()) > 50:
+                      all_content.append({
+                          'filename': filename,
+                          'content': content.strip(),
+                          'file_id': file_id
+                      })
+                      processed_count += 1
+                      print(f"  ✓ Successfully processed: {filename} ({len(content)} chars)")
+                  else:
+                      print(f"  ✗ Empty or insufficient content")
+                      
+              except Exception as e:
+                  print(f"  ✗ Error: {str(e)[:100]}")
+                  continue
+          
+          print("\n" + "=" * 60)
+          print(f"SUMMARY: Successfully processed {processed_count} files")
+          print("=" * 60)
+          
+          if not all_content:
+              raise Exception(
+                  "No files could be downloaded.\n\n"
+                  "SOLUTION: Please make individual files public:\n"
+                  "1. Open the Google Drive folder\n"
+                  "2. Select all files in the folder\n"
+                  "3. Right-click → Share\n"
+                  "4. Change to 'Anyone with the link' can VIEW\n"
+                  "5. Make sure the folder itself is also shared\n\n"
+                  "The folder permissions alone are not enough - files must be individually shared too."
+              )
+          
+          # Combine all content
+          combined_text = "\n\n=== NEW DOCUMENT ===\n\n".join([
+              f"FILE: {item['filename']}\n\n{item['content']}" 
+              for item in all_content
+          ])
+          
+          # Write content to Kestra's internal storage using outputFiles
+          output_file = 'study_content.txt'
+          with open(output_file, 'w', encoding='utf-8') as f:
+              f.write(combined_text)
+          
+          print(f"\nContent written to: {output_file}")
+          print(f"Total content size: {len(combined_text)} characters")
+          
+          Kestra.outputs({
+              'content_file': output_file,
+              'content_preview': combined_text[:1000],
+              'file_count': len(all_content),
+              'folder_id': folder_id,
+              'files_processed': [item['filename'] for item in all_content],
+              'content_size': len(combined_text)
+          })
+          
       except Exception as e:
-          print(f"Error fetching data: {e}")
+          print(f"\n{'='*60}")
+          print(f"ERROR: {e}")
+          print(f"{'='*60}")
+          print("\nREQUIRED STEPS:")
+          print("1. Go to Google Drive folder: " + folder_id)
+          print("2. Select ALL files (Ctrl+A / Cmd+A)")
+          print("3. Right-click → Share")
+          print("4. Change 'Restricted' to 'Anyone with the link'")
+          print("5. Set permission to 'Viewer'")
+          print("6. Also share the folder itself with 'Anyone with the link'")
           raise
 
-  - id: ai_analysis
+  # Task 2: AI Analysis with Enhanced Prompting
+  - id: ai_comprehensive_analysis
     type: io.kestra.plugin.scripts.python.Script
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
     containerImage: python:3.11-slim
+    inputFiles:
+      study_content.txt: "{{ outputs.fetch_drive_folder.outputFiles['study_content.txt'] }}"
+    outputFiles:
+      - "ai_analysis_result.txt"
     beforeCommands:
       - pip install kestra requests
     env:
-      # SAFE WAY: Pass content as an environment variable to handle special characters/quotes
-      NOTES_CONTENT: "{{ outputs.fetch_data.vars.content }}"
+      HF_API_KEY: "{{ inputs.huggingface_api_key }}"
     script: |
       import os
       import requests
+      import json
       from kestra import Kestra
 
-      # Retrieve content safely from environment variable
-      content = os.environ.get("NOTES_CONTENT", "")
-      api_key = "{{ inputs.huggingface_api_key }}"
+      # Read content from inputFiles (automatically mounted in working directory)
+      content_file = 'study_content.txt'
+      try:
+          with open(content_file, 'r', encoding='utf-8') as f:
+              content = f.read()
+          print(f"Read {len(content)} characters from file")
+      except Exception as e:
+          print(f"Error reading content file: {e}")
+          content = ""
+      
+      api_key = os.environ.get("HF_API_KEY", "")
       
       API_URL = "https://router.huggingface.co/v1/chat/completions"
       headers = {
@@ -63,23 +295,28 @@ tasks:
           "Content-Type": "application/json"
       }
 
-      # Define JSON format separately to avoid Pebble/Python f-string conflict with curly braces
-      json_fmt = '{"summary": "...", "difficulty": "..."}'
+      # Create JSON template
+      json_template = {
+        "summary": "3-sentence summary of all content",
+        "difficulty": "TOUGH or SIMPLE",
+        "topics": ["topic1", "topic2", "topic3"],
+        "key_concepts": ["concept1", "concept2", "concept3"],
+        "estimated_study_hours": 5,
+        "prerequisites": ["prerequisite1", "prerequisite2"]
+      }
 
-      prompt = f"""Analyze the following study notes. 1) Summarize them in 3 sentences. 2) Classify difficulty as exactly 'TOUGH' or 'SIMPLE'. 3) Return ONLY valid JSON in this format: {json_fmt}. Do not add any conversational text before or after the JSON.
+      # Request structured analysis
+      prompt = f"""Analyze these study notes and extract key information. Return ONLY valid JSON with this exact structure:
+      {json.dumps(json_template, indent=2)}
 
       Notes:
-      {content}
+      {content[:4000]}
       """
 
       payload = {
           "model": "HuggingFaceTB/SmolLM3-3B:hf-inference",
-          "messages": [
-              {
-                  "role": "user",
-                  "content": prompt
-              }
-          ],
+          "messages": [{"role": "user", "content": prompt}],
+          "max_tokens": 1000
       }
 
       try:
@@ -88,128 +325,504 @@ tasks:
           
           result = response.json()
           generated_text = result["choices"][0]["message"]["content"]
-          Kestra.outputs({'result': generated_text})
+          
+          # Write result to file to avoid environment variable issues
+          with open('ai_analysis_result.txt', 'w', encoding='utf-8') as f:
+              f.write(generated_text)
+          
+          print(f"AI analysis complete. Result length: {len(generated_text)} characters")
+          Kestra.outputs({'result_preview': generated_text[:500]})
 
       except Exception as e:
           print(f"Error during AI analysis: {e}")
           if 'response' in locals():
-              print(f"Response Status: {response.status_code}")
-              print(f"Response Body: {response.text}")
+              print(f"Response: {response.text}")
           raise
 
-  - id: parse_json
+  # Task 3: Parse JSON Analysis
+  - id: parse_analysis
     type: io.kestra.plugin.scripts.python.Script
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
     containerImage: python:3.11-slim
+    inputFiles:
+      ai_analysis_result.txt: "{{ outputs.ai_comprehensive_analysis.outputFiles['ai_analysis_result.txt'] }}"
     beforeCommands:
       - pip install kestra
-    env:
-      RAW_OUTPUT: "{{ outputs.ai_analysis.vars.result }}"
     script: |
       import json
       import os
       import re
       from kestra import Kestra
 
-      raw_output = os.environ.get('RAW_OUTPUT', '')
+      # Read from file instead of environment variable
+      try:
+          with open('ai_analysis_result.txt', 'r', encoding='utf-8') as f:
+              raw_output = f.read()
+          print(f"Read {len(raw_output)} characters from AI analysis result")
+      except Exception as e:
+          print(f"Error reading AI result: {e}")
+          raw_output = ''
       
       try:
-          # Find JSON object using regex to capture the first valid JSON block
           match = re.search(r'\{.*\}', raw_output, re.DOTALL)
           
           if match:
               json_str = match.group(0)
-              decoder = json.JSONDecoder()
-              data, _ = decoder.raw_decode(json_str)
+              data = json.loads(json_str)
               
               Kestra.outputs({
-                  'summary': data.get('summary', 'No summary provided'),
-                  'difficulty': data.get('difficulty', 'UNKNOWN')
+                  'summary': data.get('summary', 'No summary'),
+                  'difficulty': data.get('difficulty', 'UNKNOWN'),
+                  'topics': json.dumps(data.get('topics', [])),
+                  'key_concepts': json.dumps(data.get('key_concepts', [])),
+                  'estimated_hours': data.get('estimated_study_hours', 10),
+                  'prerequisites': json.dumps(data.get('prerequisites', []))
               })
           else:
-              print("No JSON found in output")
-              Kestra.outputs({'difficulty': 'UNKNOWN', 'summary': 'Error parsing output'})
+              print("No JSON found, using defaults")
+              Kestra.outputs({
+                  'difficulty': 'UNKNOWN',
+                  'summary': 'Error parsing',
+                  'topics': '[]',
+                  'key_concepts': '[]',
+                  'estimated_hours': 10,
+                  'prerequisites': '[]'
+              })
               
       except Exception as e:
-          print(f"Error parsing JSON: {e}")
-          Kestra.outputs({'difficulty': 'ERROR', 'summary': str(e)})
+          print(f"Error: {e}")
+          Kestra.outputs({
+              'difficulty': 'ERROR',
+              'summary': str(e),
+              'topics': '[]',
+              'key_concepts': '[]',
+              'estimated_hours': 10,
+              'prerequisites': '[]'
+          })
 
+  # Task 4: Generate Smart Study Plan
+  - id: generate_study_plan
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install kestra requests
+    env:
+      TOPICS: "{{ outputs.parse_analysis.vars.topics }}"
+      KEY_CONCEPTS: "{{ outputs.parse_analysis.vars.key_concepts }}"
+      ESTIMATED_HOURS: "{{ outputs.parse_analysis.vars.estimated_hours }}"
+      DAILY_HOURS: "{{ inputs.user_study_hours_per_day }}"
+      SUMMARY: "{{ outputs.parse_analysis.vars.summary }}"
+      HF_API_KEY: "{{ inputs.huggingface_api_key }}"
+    script: |
+      import os
+      import json
+      import requests
+      from datetime import datetime, timedelta
+      from kestra import Kestra
+
+      topics = json.loads(os.environ.get('TOPICS', '[]'))
+      concepts = json.loads(os.environ.get('KEY_CONCEPTS', '[]'))
+      total_hours = float(os.environ.get('ESTIMATED_HOURS', 10))
+      daily_hours = float(os.environ.get('DAILY_HOURS', 2))
+      summary = os.environ.get('SUMMARY', '')
+      api_key = os.environ.get('HF_API_KEY', '')
+      
+      API_URL = "https://router.huggingface.co/v1/chat/completions"
+      headers = {
+          "Authorization": f"Bearer {api_key}",
+          "Content-Type": "application/json"
+      }
+
+      # Calculate study timeline
+      total_days = int(total_hours / daily_hours) + 1
+      
+      # Create JSON template for study plan
+      plan_template = [
+        {
+          "day": 1,
+          "topic": "topic name",
+          "duration_hours": 2.0,
+          "activities": ["activity1", "activity2"],
+          "learning_objective": "what to achieve"
+        }
+      ]
+      
+      # Generate detailed study plan using AI
+      prompt = f"""Create a detailed study plan for these topics. Return ONLY valid JSON array with this structure:
+      {json.dumps(plan_template, indent=2)}
+      
+      Topics: {', '.join(topics)}
+      Key Concepts: {', '.join(concepts)}
+      Total study time: {total_hours} hours over {total_days} days
+      Daily availability: {daily_hours} hours
+      
+      Create a progressive plan that builds knowledge logically."""
+
+      payload = {
+          "model": "HuggingFaceTB/SmolLM3-3B:hf-inference",
+          "messages": [{"role": "user", "content": prompt}],
+          "max_tokens": 1500
+      }
+
+      try:
+          response = requests.post(API_URL, headers=headers, json=payload)
+          response.raise_for_status()
+          result = response.json()
+          ai_plan_text = result["choices"][0]["message"]["content"]
+          
+          # Try to parse AI response
+          import re
+          match = re.search(r'\[.*\]', ai_plan_text, re.DOTALL)
+          if match:
+              study_schedule = json.loads(match.group(0))
+          else:
+              # Fallback plan
+              study_schedule = []
+              hours_per_topic = total_hours / max(len(topics), 1)
+              for i, topic in enumerate(topics, 1):
+                  study_schedule.append({
+                      "day": i,
+                      "topic": topic,
+                      "duration_hours": hours_per_topic,
+                      "activities": ["Read notes", "Practice problems", "Review"],
+                      "learning_objective": f"Master {topic}"
+                  })
+
+          # Add dates to schedule
+          start_date = datetime.now()
+          for item in study_schedule:
+              study_date = start_date + timedelta(days=item['day']-1)
+              item['date'] = study_date.strftime('%Y-%m-%d')
+              item['day_of_week'] = study_date.strftime('%A')
+
+          Kestra.outputs({
+              'study_plan': json.dumps(study_schedule, indent=2),
+              'total_days': total_days,
+              'completion_date': (start_date + timedelta(days=total_days-1)).strftime('%Y-%m-%d')
+          })
+
+      except Exception as e:
+          print(f"Error generating study plan: {e}")
+          # Output basic fallback plan
+          basic_plan = [{
+              "day": 1,
+              "topic": "Review all materials",
+              "duration_hours": daily_hours,
+              "activities": ["Read", "Summarize", "Practice"],
+              "learning_objective": "Understand core concepts",
+              "date": datetime.now().strftime('%Y-%m-%d'),
+              "day_of_week": datetime.now().strftime('%A')
+          }]
+          Kestra.outputs({
+              'study_plan': json.dumps(basic_plan, indent=2),
+              'total_days': 1,
+              'completion_date': datetime.now().strftime('%Y-%m-%d')
+          })
+
+  # Task 5: Search YouTube for difficult topics
   - id: check_difficulty
     type: io.kestra.plugin.core.flow.If
-    condition: "{{ outputs.parse_json.vars.difficulty == 'TOUGH' }}"
+    condition: "{{ outputs.parse_analysis.vars.difficulty == 'TOUGH' }}"
     then:
-      - id: search_youtube
+      - id: search_youtube_videos
         type: io.kestra.plugin.scripts.python.Script
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
         containerImage: python:3.11-slim
         beforeCommands:
           - pip install requests kestra
+        env:
+          TOPICS: "{{ outputs.parse_analysis.vars.topics }}"
+          SERPAPI_KEY: "{{ inputs.serpapi_api_key }}"
         script: |
           import requests
+          import json
+          import os
           from kestra import Kestra
 
-          api_key = "{{ inputs.serpapi_api_key }}"
-          query = "Lecture on {{ outputs.parse_json.vars.summary }}"
+          api_key = os.environ.get('SERPAPI_KEY', '')
+          topics = json.loads(os.environ.get('TOPICS', '[]'))
           
-          print(f"Searching YouTube for: {query}")
+          video_results = []
           
-          params = {
-            "engine": "youtube",
-            "search_query": query,
-            "api_key": api_key
-          }
-          
-          try:
-              response = requests.get("https://serpapi.com/search", params=params)
-              response.raise_for_status()
-              results = response.json()
+          for topic in topics[:3]:  # Limit to top 3 topics
+              query = f"{topic} tutorial lecture"
+              print(f"Searching YouTube for: {query}")
               
-              video_results = results.get("video_results", [])
+              params = {
+                  "engine": "youtube",
+                  "search_query": query,
+                  "api_key": api_key
+              }
               
-              if video_results:
-                  first_video = video_results[0]
-                  title = first_video.get("title", "Unknown Title")
-                  link = first_video.get("link", "No Link")
-                  print(f"Found video: {title} - {link}")
-                  Kestra.outputs({'video_title': title, 'video_link': link})
-              else:
-                  print("No video results found.")
-                  Kestra.outputs({'video_title': 'Not Found', 'video_link': 'None'})
+              try:
+                  response = requests.get("https://serpapi.com/search", params=params)
+                  response.raise_for_status()
+                  results = response.json()
+                  
+                  videos = results.get("video_results", [])
+                  
+                  if videos:
+                      first_video = videos[0]
+                      video_results.append({
+                          "topic": topic,
+                          "title": first_video.get("title", "Unknown"),
+                          "link": first_video.get("link", ""),
+                          "channel": first_video.get("channel", {}).get("name", "Unknown"),
+                          "duration": first_video.get("length", "")
+                      })
+                      
+              except Exception as e:
+                  print(f"Error searching for {topic}: {e}")
+                  continue
 
-          except Exception as e:
-              print(f"Error searching SerpApi: {e}")
-              raise
+          Kestra.outputs({
+              'video_recommendations': json.dumps(video_results, indent=2),
+              'video_count': len(video_results)
+          })
 
-  - id: final_output
+  # Task 6: Final Output Assembly
+  - id: assemble_final_output
     type: io.kestra.plugin.scripts.python.Script
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
     containerImage: python:3.11-slim
+    outputFiles:
+      - "study_report.md"
+      - "study_report.json"
     beforeCommands:
       - pip install kestra
     env:
-      SUMMARY: "{{ outputs.parse_json.vars.summary }}"
-      DIFFICULTY: "{{ outputs.parse_json.vars.difficulty }}"
-      VIDEO_TITLE: "{{ outputs.search_youtube is defined ? outputs.search_youtube.vars.video_title : 'None' }}"
-      VIDEO_LINK: "{{ outputs.search_youtube is defined ? outputs.search_youtube.vars.video_link : 'None' }}"
+      FILE_COUNT: "{{ outputs.fetch_drive_folder.vars.file_count }}"
+      FOLDER_ID: "{{ outputs.fetch_drive_folder.vars.folder_id }}"
+      SUMMARY: "{{ outputs.parse_analysis.vars.summary }}"
+      DIFFICULTY: "{{ outputs.parse_analysis.vars.difficulty }}"
+      TOPICS: "{{ outputs.parse_analysis.vars.topics }}"
+      KEY_CONCEPTS: "{{ outputs.parse_analysis.vars.key_concepts }}"
+      PREREQUISITES: "{{ outputs.parse_analysis.vars.prerequisites }}"
+      ESTIMATED_HOURS: "{{ outputs.parse_analysis.vars.estimated_hours }}"
+      STUDY_PLAN: "{{ outputs.generate_study_plan.vars.study_plan }}"
+      TOTAL_DAYS: "{{ outputs.generate_study_plan.vars.total_days }}"
+      COMPLETION_DATE: "{{ outputs.generate_study_plan.vars.completion_date }}"
+      VIDEO_RECS: "{{ outputs.search_youtube_videos is defined ? outputs.search_youtube_videos.vars.video_recommendations : '[]' }}"
     script: |
       import os
+      import json
+      from datetime import datetime
       from kestra import Kestra
 
-      summary = os.environ.get('SUMMARY')
-      difficulty = os.environ.get('DIFFICULTY')
-      video_title = os.environ.get('VIDEO_TITLE')
-      video_link = os.environ.get('VIDEO_LINK')
-
-      outputs = {
-          'summary': summary,
-          'difficulty': difficulty
+      # Parse all inputs
+      file_count = int(os.environ.get('FILE_COUNT', 0))
+      folder_id = os.environ.get('FOLDER_ID', '')
+      summary = os.environ.get('SUMMARY', 'No summary available')
+      difficulty = os.environ.get('DIFFICULTY', 'UNKNOWN')
+      topics = json.loads(os.environ.get('TOPICS', '[]'))
+      key_concepts = json.loads(os.environ.get('KEY_CONCEPTS', '[]'))
+      prerequisites = json.loads(os.environ.get('PREREQUISITES', '[]'))
+      estimated_hours = float(os.environ.get('ESTIMATED_HOURS', 0))
+      study_plan = json.loads(os.environ.get('STUDY_PLAN', '[]'))
+      total_days = int(os.environ.get('TOTAL_DAYS', 0))
+      completion_date = os.environ.get('COMPLETION_DATE', 'N/A')
+      video_recs = json.loads(os.environ.get('VIDEO_RECS', '[]'))
+      
+      # Create structured JSON output
+      json_output = {
+          'metadata': {
+              'generated_at': datetime.now().isoformat(),
+              'status': 'success',
+              'folder_id': folder_id,
+              'files_processed': file_count
+          },
+          'analysis': {
+              'summary': summary,
+              'difficulty': difficulty,
+              'estimated_hours': estimated_hours,
+              'topics': topics,
+              'key_concepts': key_concepts,
+              'prerequisites': prerequisites
+          },
+          'study_plan': {
+              'total_days': total_days,
+              'completion_date': completion_date,
+              'schedule': study_plan
+          },
+          'video_resources': video_recs
       }
-
-      if video_title != 'None':
-          outputs['video_title'] = video_title
-          outputs['video_link'] = video_link
+      
+      # Save JSON file
+      with open('study_report.json', 'w', encoding='utf-8') as f:
+          json.dump(json_output, f, indent=2, ensure_ascii=False)
+      
+      # Create beautiful Markdown report
+      md_lines = []
+      md_lines.append("# 📚 Study Helper Report")
+      md_lines.append("")
+      md_lines.append(f"**Generated:** {datetime.now().strftime('%B %d, %Y at %I:%M %p')}")
+      md_lines.append("")
+      
+      # Overview Section
+      md_lines.append("---")
+      md_lines.append("## 📋 Overview")
+      md_lines.append("")
+      md_lines.append(f"| Property | Value |")
+      md_lines.append(f"|----------|-------|")
+      md_lines.append(f"| Files Processed | {file_count} |")
+      md_lines.append(f"| Difficulty Level | **{difficulty}** |")
+      md_lines.append(f"| Estimated Study Time | {estimated_hours} hours |")
+      md_lines.append(f"| Study Duration | {total_days} days |")
+      md_lines.append(f"| Target Completion | {completion_date} |")
+      md_lines.append("")
+      
+      # Summary Section
+      md_lines.append("---")
+      md_lines.append("## 📝 Summary")
+      md_lines.append("")
+      md_lines.append(f"> {summary}")
+      md_lines.append("")
+      
+      # Topics Section
+      md_lines.append("---")
+      md_lines.append("## 📌 Topics Covered")
+      md_lines.append("")
+      for i, topic in enumerate(topics, 1):
+          md_lines.append(f"{i}. {topic}")
+      md_lines.append("")
+      
+      # Key Concepts Section
+      md_lines.append("---")
+      md_lines.append("## 💡 Key Concepts")
+      md_lines.append("")
+      for concept in key_concepts:
+          md_lines.append(f"- {concept}")
+      md_lines.append("")
+      
+      # Prerequisites Section
+      if prerequisites:
+          md_lines.append("---")
+          md_lines.append("## ⚠️ Prerequisites")
+          md_lines.append("")
+          for prereq in prerequisites:
+              md_lines.append(f"- {prereq}")
+          md_lines.append("")
+      
+      # Study Plan Section
+      md_lines.append("---")
+      md_lines.append("## 📅 Study Plan")
+      md_lines.append("")
+      
+      for day_plan in study_plan:
+          day_num = day_plan.get('day', '?')
+          date = day_plan.get('date', 'N/A')
+          day_of_week = day_plan.get('day_of_week', '')
+          topic = day_plan.get('topic', 'N/A')
+          duration = day_plan.get('duration_hours', 0)
+          activities = day_plan.get('activities', [])
+          objective = day_plan.get('learning_objective', '')
           
-      Kestra.outputs(outputs)
+          md_lines.append(f"### Day {day_num}: {day_of_week}, {date}")
+          md_lines.append("")
+          md_lines.append(f"**📖 Topic:** {topic}")
+          md_lines.append("")
+          md_lines.append(f"**⏱️ Duration:** {duration} hours")
+          md_lines.append("")
+          
+          if activities:
+              md_lines.append("**✅ Activities:**")
+              for activity in activities:
+                  md_lines.append(f"- [ ] {activity}")
+              md_lines.append("")
+          
+          if objective:
+              md_lines.append(f"**🎯 Goal:** {objective}")
+              md_lines.append("")
+          
+          md_lines.append("---")
+          md_lines.append("")
+      
+      # Video Resources Section
+      if video_recs:
+          md_lines.append("## 🎥 Recommended Videos")
+          md_lines.append("")
+          md_lines.append("Since this material is marked as **TOUGH**, here are some helpful video resources:")
+          md_lines.append("")
+          
+          for i, video in enumerate(video_recs, 1):
+              topic = video.get('topic', 'Unknown')
+              title = video.get('title', 'No title')
+              channel = video.get('channel', 'Unknown')
+              duration = video.get('duration', 'N/A')
+              link = video.get('link', '#')
+              
+              md_lines.append(f"### {i}. {topic}")
+              md_lines.append("")
+              md_lines.append(f"- **Title:** [{title}]({link})")
+              md_lines.append(f"- **Channel:** {channel}")
+              md_lines.append(f"- **Duration:** {duration}")
+              md_lines.append("")
+      
+      # Footer
+      md_lines.append("---")
+      md_lines.append("")
+      md_lines.append("## 🚀 Good Luck!")
+      md_lines.append("")
+      md_lines.append("*This study plan was automatically generated by Study Helper.*")
+      md_lines.append("")
+      md_lines.append("**Tips for success:**")
+      md_lines.append("- ✅ Follow the schedule consistently")
+      md_lines.append("- ✅ Take breaks every 25-30 minutes (Pomodoro technique)")
+      md_lines.append("- ✅ Review previous day's material before starting new topics")
+      md_lines.append("- ✅ Practice active recall instead of passive reading")
+      md_lines.append("")
+      
+      # Save Markdown file
+      md_content = "\n".join(md_lines)
+      with open('study_report.md', 'w', encoding='utf-8') as f:
+          f.write(md_content)
+      
+      # Output to Kestra
+      Kestra.outputs({
+          'status': 'success',
+          'files_processed': file_count,
+          'difficulty': difficulty,
+          'total_days': total_days,
+          'completion_date': completion_date,
+          'topics_count': len(topics),
+          'video_count': len(video_recs),
+          'report_markdown': 'study_report.md',
+          'report_json': 'study_report.json'
+      })
+      
+      # Print summary to logs
+      print("\n" + "=" * 60)
+      print("           📚 STUDY HELPER - EXECUTION COMPLETE 📚")
+      print("=" * 60)
+      print()
+      print(f"  ✓ Files Processed:     {file_count}")
+      print(f"  ✓ Difficulty Level:    {difficulty}")
+      print(f"  ✓ Estimated Hours:     {estimated_hours}")
+      print(f"  ✓ Study Duration:      {total_days} days")
+      print(f"  ✓ Target Completion:   {completion_date}")
+      print(f"  ✓ Topics Identified:   {len(topics)}")
+      print(f"  ✓ Video Resources:     {len(video_recs)}")
+      print()
+      print("-" * 60)
+      print("  📄 Output Files Generated:")
+      print("     • study_report.md   (Formatted Markdown Report)")
+      print("     • study_report.json (Structured JSON Data)")
+      print("-" * 60)
+      print()
+      print("  📝 Summary:")
+      print(f"     {summary[:200]}...")
+      print()
+      print("  📌 Topics:")
+      for i, topic in enumerate(topics[:5], 1):
+          print(f"     {i}. {topic}")
+      if len(topics) > 5:
+          print(f"     ... and {len(topics) - 5} more")
+      print()
+      print("=" * 60)
+      print("        ✅ Study plan ready! Good luck with your studies! 🚀")
+      print("=" * 60)
